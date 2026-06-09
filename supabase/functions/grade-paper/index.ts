@@ -46,6 +46,11 @@ type JudgeResult = {
   updatedAt: string;
 };
 
+type PaperAnswerMap = Record<string, string>;
+type PaperJudgeMap = Record<string, JudgeResult>;
+
+const MAX_QUESTIONS_PER_BATCH = 5;
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -57,6 +62,14 @@ const providerLabels: Record<string, string> = {
   doubao: "Doubao",
   deepseek: "DeepSeek",
 };
+
+function chunkItems<T>(items: T[], chunkSize: number) {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    result.push(items.slice(index, index + chunkSize));
+  }
+  return result;
+}
 
 function createSupabaseAdmin() {
   const url = Deno.env.get("SUPABASE_URL");
@@ -129,30 +142,56 @@ async function requestChatCompletion(config: ModelConfigRow, messages: ChatMessa
   return content;
 }
 
-function buildAnswerMessages(question: QuestionRow, config: ModelConfigRow): ChatMessage[] {
+function formatQuestionForPrompt(question: QuestionRow) {
   return [
-    { role: "system", content: config.system_prompt },
+    `questionId: ${question.id}`,
+    `title: ${question.title}`,
+    `type: ${question.question_type}`,
+    `score: ${question.score}`,
+    `prompt: ${question.prompt_latex}`,
+    question.options_json?.length
+      ? `options:\n${question.options_json.map((item, index) => `${String.fromCharCode(65 + index)}. ${item}`).join("\n")}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildPaperAnswerMessages(questions: QuestionRow[], config: ModelConfigRow): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: `${config.system_prompt}
+
+请严格输出 JSON，不要使用 Markdown 代码块。JSON 结构如下：
+{
+  "answers": {
+    "question-id-1": "答案",
+    "question-id-2": "答案"
+  }
+}
+
+要求：
+1. 必须覆盖所有 questionId。
+2. 单选题只返回一个选项字母。
+3. 多选题只返回全部选项字母，格式如 A,B。
+4. 填空题只返回结果。
+5. 解答题返回必要步骤和最终答案。`,
+    },
     {
       role: "user",
       content: [
-        `题目标题：${question.title}`,
-        `题目类型：${question.question_type}`,
-        `题目内容：${question.prompt_latex}`,
-        question.options_json?.length
-          ? `选项：${question.options_json.map((item, index) => `${String.fromCharCode(65 + index)}. ${item}`).join("\n")}`
-          : "",
-        "请直接输出最终答案。",
-      ]
-        .filter(Boolean)
-        .join("\n\n"),
+        "请完成整张试卷作答，并按指定 JSON 返回。",
+        ...questions.map((question, index) => `【第 ${index + 1} 题】\n${formatQuestionForPrompt(question)}`),
+      ].join("\n\n"),
     },
   ];
 }
 
-function buildJudgeMessages(
-  question: QuestionRow,
-  answerKey: AnswerKeyRow | undefined,
-  answerText: string,
+function buildPaperJudgeMessages(
+  questions: QuestionRow[],
+  answerKeyMap: Map<string, AnswerKeyRow>,
+  answers: PaperAnswerMap,
   config: ModelConfigRow,
   answerLabel: string,
 ): ChatMessage[] {
@@ -163,27 +202,42 @@ function buildJudgeMessages(
 
 请严格输出 JSON，不要使用 Markdown 代码块。JSON 结构如下：
 {
-  "totalScore": 5,
-  "maxScore": 5,
-  "dimensions": [
-    { "name": "正确性", "score": 3, "reason": "..." }
-  ],
-  "summary": "总体点评",
-  "confidence": 0.9
-}`,
+  "results": {
+    "question-id-1": {
+      "totalScore": 5,
+      "maxScore": 5,
+      "dimensions": [
+        { "name": "正确性", "score": 3, "reason": "..." }
+      ],
+      "summary": "总体点评",
+      "confidence": 0.9
+    }
+  }
+}
+
+要求：
+1. 必须覆盖所有 questionId。
+2. 每题 maxScore 必须等于该题满分。
+3. totalScore 必须在 0 到 maxScore 之间。`,
     },
     {
       role: "user",
-      content: [
-        `题目标题：${question.title}`,
-        `题目类型：${question.question_type}`,
-        `题目满分：${question.score}`,
-        `题目内容：${question.prompt_latex}`,
-        `参考答案：${answerKey?.reference_answer ?? "未提供"}`,
-        `评分标准：${answerKey?.scoring_rubric ?? `总分 ${question.score} 分，请按正确性、完整性、逻辑性评分。`}`,
-        `${answerLabel}：${answerText}`,
-        `请输出合法 JSON。maxScore 必须等于 ${question.score}，totalScore 必须在 0 到 ${question.score} 之间。`,
-      ].join("\n\n"),
+      content: questions
+        .map((question, index) => {
+          const answerKey = answerKeyMap.get(question.id);
+          return [
+            `【第 ${index + 1} 题】`,
+            `questionId: ${question.id}`,
+            `title: ${question.title}`,
+            `type: ${question.question_type}`,
+            `maxScore: ${question.score}`,
+            `prompt: ${question.prompt_latex}`,
+            `referenceAnswer: ${answerKey?.reference_answer ?? "未提供"}`,
+            `scoringRubric: ${answerKey?.scoring_rubric ?? `总分 ${question.score} 分，请按正确性、完整性、逻辑性评分。`}`,
+            `${answerLabel}: ${answers[question.id] ?? ""}`,
+          ].join("\n");
+        })
+        .join("\n\n"),
     },
   ];
 }
@@ -203,18 +257,75 @@ function extractJson(content: string) {
   return content.trim();
 }
 
-function parseJudgeResult(content: string, questionId: string): JudgeResult {
-  const parsed = JSON.parse(extractJson(content)) as Omit<JudgeResult, "questionId" | "updatedAt">;
+function parsePaperAnswers(content: string, questions: QuestionRow[]) {
+  const parsed = JSON.parse(extractJson(content)) as {
+    answers?: Record<string, unknown> | Array<{ questionId?: string; answer?: string }>;
+  } | Record<string, unknown>;
 
-  return {
-    questionId,
-    totalScore: parsed.totalScore ?? 0,
-    maxScore: parsed.maxScore ?? 0,
-    dimensions: Array.isArray(parsed.dimensions) ? parsed.dimensions : [],
-    summary: parsed.summary ?? "",
-    confidence: parsed.confidence,
-    updatedAt: new Date().toISOString(),
-  };
+  const rawAnswers = "answers" in parsed ? parsed.answers : parsed;
+  const answers: PaperAnswerMap = {};
+
+  if (Array.isArray(rawAnswers)) {
+    rawAnswers.forEach((item) => {
+      if (item?.questionId) {
+        answers[item.questionId] = String(item.answer ?? "").trim();
+      }
+    });
+  } else if (rawAnswers && typeof rawAnswers === "object") {
+    Object.entries(rawAnswers).forEach(([questionId, answer]) => {
+      answers[questionId] = String(answer ?? "").trim();
+    });
+  }
+
+  questions.forEach((question) => {
+    if (!(question.id in answers)) {
+      answers[question.id] = "";
+    }
+  });
+
+  return answers;
+}
+
+function parsePaperJudgeResults(content: string, questions: QuestionRow[]) {
+  const parsed = JSON.parse(extractJson(content)) as {
+    results?: Record<string, Omit<JudgeResult, "questionId" | "updatedAt">>;
+  } | Record<string, Omit<JudgeResult, "questionId" | "updatedAt">>;
+
+  const rawResults = "results" in parsed ? parsed.results : parsed;
+  const judgeResults: PaperJudgeMap = {};
+
+  if (rawResults && typeof rawResults === "object") {
+    Object.entries(rawResults).forEach(([questionId, value]) => {
+      if (!value || typeof value !== "object") {
+        return;
+      }
+      const result = value as Omit<JudgeResult, "questionId" | "updatedAt">;
+      judgeResults[questionId] = {
+        questionId,
+        totalScore: result.totalScore ?? 0,
+        maxScore: result.maxScore ?? 0,
+        dimensions: Array.isArray(result.dimensions) ? result.dimensions : [],
+        summary: result.summary ?? "",
+        confidence: result.confidence,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  questions.forEach((question) => {
+    if (!judgeResults[question.id]) {
+      judgeResults[question.id] = {
+        questionId: question.id,
+        totalScore: 0,
+        maxScore: Number(question.score ?? 0),
+        dimensions: [],
+        summary: "判卷结果缺失。",
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  });
+
+  return judgeResults;
 }
 
 async function loadPaperContext(supabase: ReturnType<typeof createSupabaseAdmin>, paperId: string) {
@@ -303,22 +414,23 @@ Deno.serve(async (request) => {
       const judgeConfig = await loadModelConfig(supabase, "judge", paperId);
       const sourceAnswers = (payload.answers ?? {}) as Record<string, string>;
       const answers: Record<string, string> = {};
-      const judgeResults: Record<string, JudgeResult> = {};
+      questions.forEach((question) => {
+        answers[question.id] = String(sourceAnswers[question.id] ?? "");
+      });
+      const judgeResults: PaperJudgeMap = {};
 
-      for (const question of questions) {
-        const answer = String(sourceAnswers[question.id] ?? "");
-        answers[question.id] = answer;
+      for (const batch of chunkItems(questions, MAX_QUESTIONS_PER_BATCH)) {
         const judgeContent = await requestChatCompletion(
           judgeConfig,
-          buildJudgeMessages(
-            question,
-            answerKeyMap.get(question.id),
-            answer,
+          buildPaperJudgeMessages(
+            batch,
+            answerKeyMap,
+            answers,
             judgeConfig,
             "用户答案",
           ),
         );
-        judgeResults[question.id] = parseJudgeResult(judgeContent, question.id);
+        Object.assign(judgeResults, parsePaperJudgeResults(judgeContent, batch));
       }
 
       const totalScore = Object.values(judgeResults).reduce(
@@ -343,6 +455,58 @@ Deno.serve(async (request) => {
       );
     }
 
+    if (payload.action === "run-provider-question") {
+      const providerId = String(payload.providerId ?? "");
+      const questionId = String(payload.questionId ?? "");
+      if (!providerId) {
+        throw new Error("providerId 不能为空。");
+      }
+      if (!questionId) {
+        throw new Error("questionId 不能为空。");
+      }
+      if (!(providerId in providerLabels)) {
+        throw new Error("当前仅支持 doubao 和 deepseek。");
+      }
+
+      const question = questions.find((item) => item.id === questionId);
+      if (!question) {
+        throw new Error("题目不存在。");
+      }
+
+      const answerConfig = await loadModelConfig(supabase, "answer", paperId, providerId);
+      const judgeConfig = await loadModelConfig(supabase, "judge", paperId);
+      const answerContent = await requestChatCompletion(
+        answerConfig,
+        buildPaperAnswerMessages([question], answerConfig),
+      );
+      const answers = parsePaperAnswers(answerContent, [question]);
+      const judgeContent = await requestChatCompletion(
+        judgeConfig,
+        buildPaperJudgeMessages(
+          [question],
+          answerKeyMap,
+          answers,
+          judgeConfig,
+          `${providerLabels[providerId] ?? providerId} 答案`,
+        ),
+      );
+      const judgeResults = parsePaperJudgeResults(judgeContent, [question]);
+
+      return new Response(
+        JSON.stringify({
+          respondent: providerLabels[providerId] ?? providerId,
+          respondentType: "model",
+          providerId,
+          paperId: paper.id,
+          questionId: question.id,
+          answer: answers[question.id] ?? "",
+          judgeResult: judgeResults[question.id],
+          answeredAt: new Date().toISOString(),
+        }),
+        { headers: corsHeaders },
+      );
+    }
+
     if (payload.action === "run-provider-paper") {
       const providerId = String(payload.providerId ?? "");
       if (!providerId) {
@@ -354,26 +518,29 @@ Deno.serve(async (request) => {
 
       const answerConfig = await loadModelConfig(supabase, "answer", paperId, providerId);
       const judgeConfig = await loadModelConfig(supabase, "judge", paperId);
-      const answers: Record<string, string> = {};
-      const judgeResults: Record<string, JudgeResult> = {};
+      const answers: PaperAnswerMap = {};
+      const judgeResults: PaperJudgeMap = {};
 
-      for (const question of questions) {
-        const answer = await requestChatCompletion(
+      for (const batch of chunkItems(questions, MAX_QUESTIONS_PER_BATCH)) {
+        const answerContent = await requestChatCompletion(
           answerConfig,
-          buildAnswerMessages(question, answerConfig),
+          buildPaperAnswerMessages(batch, answerConfig),
         );
-        answers[question.id] = answer;
+        Object.assign(answers, parsePaperAnswers(answerContent, batch));
+      }
+
+      for (const batch of chunkItems(questions, MAX_QUESTIONS_PER_BATCH)) {
         const judgeContent = await requestChatCompletion(
           judgeConfig,
-          buildJudgeMessages(
-            question,
-            answerKeyMap.get(question.id),
-            answer,
+          buildPaperJudgeMessages(
+            batch,
+            answerKeyMap,
+            answers,
             judgeConfig,
             `${providerLabels[providerId] ?? providerId} 答案`,
           ),
         );
-        judgeResults[question.id] = parseJudgeResult(judgeContent, question.id);
+        Object.assign(judgeResults, parsePaperJudgeResults(judgeContent, batch));
       }
 
       const totalScore = Object.values(judgeResults).reduce(

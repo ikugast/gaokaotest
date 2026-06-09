@@ -102,3 +102,14 @@ export type ChatMessage = {
 };
 
 export type RemoteGradePayload = Omit<GradeRecord, "id">;
+
+export type RemoteProviderQuestionPayload = {
+  respondent: string;
+  respondentType: "model";
+  providerId: AnswerProviderId;
+  paperId: string;
+  questionId: string;
+  answer: string;
+  judgeResult: JudgeResult;
+  answeredAt: string;
+};

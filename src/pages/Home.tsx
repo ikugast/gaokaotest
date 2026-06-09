@@ -3,7 +3,7 @@ import { LoaderCircle } from "lucide-react";
 import { MathText } from "@/components/MathText";
 import { answerProviderPresets } from "@/lib/providers";
 import { builtInPapers, getPaperById } from "@/lib/papers";
-import { invokeGradePaper } from "@/lib/supabase";
+import { invokeGradePaper, invokeProviderQuestion } from "@/lib/supabase";
 import type { AnswerProviderPreset, GradeRecord, QuestionItem, RemoteGradePayload } from "@/lib/types";
 import { useQuizStore } from "@/store/useQuizStore";
 
@@ -23,6 +23,7 @@ export default function Home() {
   const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
   const [providerProgress, setProviderProgress] = useState(0);
   const [providerMessage, setProviderMessage] = useState("");
+  const [liveProviderRecord, setLiveProviderRecord] = useState<GradeRecord | null>(null);
   const [finalScore, setFinalScore] = useState<{
     totalScore: number;
     maxScore: number;
@@ -47,6 +48,18 @@ export default function Home() {
 
     return Array.from(latest.values());
   }, [currentPaperId, modelRecords]);
+  const visibleModelRecords = useMemo(() => {
+    if (!liveProviderRecord || liveProviderRecord.paperId !== currentPaperId) {
+      return latestModelRecords;
+    }
+
+    return [
+      liveProviderRecord,
+      ...latestModelRecords.filter(
+        (record) => record.providerId !== liveProviderRecord.providerId,
+      ),
+    ];
+  }, [currentPaperId, latestModelRecords, liveProviderRecord]);
 
   const isTextQuestion = (type: string) => type === "short" || type === "essay";
 
@@ -129,20 +142,73 @@ export default function Home() {
     });
   };
 
+  const createLiveProviderRecord = (provider: AnswerProviderPreset): GradeRecord => ({
+    id: `live-${provider.id}-${Date.now()}`,
+    respondent: provider.label,
+    respondentType: "model",
+    providerId: provider.id,
+    paperId: currentPaper.id,
+    paperLabel: currentPaper.label,
+    totalScore: 0,
+    maxScore: questions.reduce((sum, question) => sum + Number(question.score ?? 0), 0),
+    submittedAt: new Date().toISOString(),
+    answers: {},
+    judgeResults: {},
+  });
+
   const runProviderPaper = async (provider: AnswerProviderPreset) => {
     setRunningProviderId(provider.id);
     setProviderProgress(0);
     setProviderMessage("");
+    const draftRecord = createLiveProviderRecord(provider);
+    setLiveProviderRecord(draftRecord);
 
     try {
-      setProviderProgress(15);
-      const record = await invokeGradePaper({
-        action: "run-provider-paper",
-        paperId: currentPaper.id,
+      const nextAnswers: Record<string, string> = {};
+      const nextJudgeResults: GradeRecord["judgeResults"] = {};
+
+      for (let index = 0; index < questions.length; index += 1) {
+        const question = questions[index];
+        setProviderMessage(`${provider.label} 正在自动作答第 ${index + 1} 题`);
+        const result = await invokeProviderQuestion({
+          action: "run-provider-question",
+          paperId: currentPaper.id,
+          providerId: provider.id,
+          questionId: question.id,
+        });
+
+        nextAnswers[question.id] = result.answer;
+        nextJudgeResults[question.id] = result.judgeResult;
+
+        setLiveProviderRecord({
+          ...draftRecord,
+          submittedAt: result.answeredAt,
+          totalScore: Object.values(nextJudgeResults).reduce(
+            (sum, item) => sum + item.totalScore,
+            0,
+          ),
+          answers: { ...nextAnswers },
+          judgeResults: { ...nextJudgeResults },
+        });
+        setProviderProgress(Math.round(((index + 1) / questions.length) * 100));
+      }
+
+      persistRecord({
+        respondent: provider.label,
+        respondentType: "model",
         providerId: provider.id,
+        paperId: currentPaper.id,
+        paperLabel: currentPaper.label,
+        totalScore: Object.values(nextJudgeResults).reduce(
+          (sum, item) => sum + item.totalScore,
+          0,
+        ),
+        maxScore: draftRecord.maxScore,
+        submittedAt: new Date().toISOString(),
+        answers: { ...nextAnswers },
+        judgeResults: { ...nextJudgeResults },
       });
-      setProviderProgress(100);
-      persistRecord(record);
+      setLiveProviderRecord(null);
       setProviderMessage(`${provider.label} 已完成自动答题和判卷。`);
     } catch (error) {
       setProviderMessage(
@@ -227,6 +293,7 @@ export default function Home() {
                   setCompletionMessage("");
                   setSubmissionError({});
                   setProviderMessage("");
+                  setLiveProviderRecord(null);
                 }}
               >
                 {paper.label}
@@ -431,9 +498,9 @@ export default function Home() {
                             </div>
                           ) : null}
 
-                          {latestModelRecords.length ? (
+                          {visibleModelRecords.length ? (
                             <div className="mt-4 space-y-3">
-                              {latestModelRecords.map((record) => {
+                              {visibleModelRecords.map((record) => {
                                 const judgeResult = record.judgeResults[question.id];
                                 return (
                                   <div

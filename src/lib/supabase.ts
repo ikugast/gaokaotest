@@ -1,5 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
-import type { AnswerProviderId, RemoteGradePayload } from "@/lib/types";
+import type {
+  AnswerProviderId,
+  RemoteGradePayload,
+  RemoteProviderQuestionPayload,
+} from "@/lib/types";
 
 type GradeUserPaperRequest = {
   action: "grade-user-paper";
@@ -13,7 +17,17 @@ type RunProviderPaperRequest = {
   providerId: AnswerProviderId;
 };
 
-type GradePaperRequest = GradeUserPaperRequest | RunProviderPaperRequest;
+type RunProviderQuestionRequest = {
+  action: "run-provider-question";
+  paperId: string;
+  providerId: AnswerProviderId;
+  questionId: string;
+};
+
+type GradePaperRequest =
+  | GradeUserPaperRequest
+  | RunProviderPaperRequest
+  | RunProviderQuestionRequest;
 
 let client: ReturnType<typeof createClient> | null = null;
 
@@ -54,4 +68,23 @@ export async function invokeGradePaper(payload: GradePaperRequest) {
   }
 
   return data as RemoteGradePayload;
+}
+
+export async function invokeProviderQuestion(
+  payload: RunProviderQuestionRequest,
+) {
+  const supabase = getSupabaseClient();
+  const { data, error } = await supabase.functions.invoke("grade-paper", {
+    body: payload,
+  });
+
+  if (error) {
+    throw new Error(error.message || "Supabase 函数调用失败。");
+  }
+
+  if (data?.error) {
+    throw new Error(String(data.error));
+  }
+
+  return data as RemoteProviderQuestionPayload;
 }
