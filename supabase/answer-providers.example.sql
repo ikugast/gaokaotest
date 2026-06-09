@@ -1,0 +1,31 @@
+insert into app_private.ai_model_configs (
+  model_role,
+  paper_id,
+  provider_name,
+  base_url,
+  model_name,
+  system_prompt,
+  secret_name,
+  enabled
+)
+values
+(
+  'answer',
+  null,
+  'doubao',
+  'https://ark.cn-beijing.volces.com/api/v3',
+  '你的Doubao模型ID',
+  '你是高考数学答题模型。单选题只返回一个选项字母，多选题只返回全部选项字母，填空题只返回结果，解答题给出必要步骤和最终答案。',
+  'DOUBAO_API_KEY',
+  true
+),
+(
+  'answer',
+  null,
+  'deepseek',
+  'https://api.deepseek.com/v1',
+  '你的DeepSeek模型ID',
+  '你是高考数学答题模型。单选题只返回一个选项字母，多选题只返回全部选项字母，填空题只返回结果，解答题给出必要步骤和最终答案。',
+  'DEEPSEEK_API_KEY',
+  true
+);
