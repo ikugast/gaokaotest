@@ -1,10 +1,8 @@
 import { useMemo, useState } from "react";
-import { LoaderCircle } from "lucide-react";
 import { MathText } from "@/components/MathText";
-import { answerProviderPresets } from "@/lib/providers";
 import { builtInPapers, getPaperById } from "@/lib/papers";
-import { invokeGradePaper, invokeProviderQuestion } from "@/lib/supabase";
-import type { AnswerProviderPreset, GradeRecord, QuestionItem, RemoteGradePayload } from "@/lib/types";
+import { invokeGradePaper } from "@/lib/supabase";
+import type { RemoteGradePayload } from "@/lib/types";
 import { useQuizStore } from "@/store/useQuizStore";
 
 export default function Home() {
@@ -20,10 +18,6 @@ export default function Home() {
   const [submissionError, setSubmissionError] = useState<Record<string, string>>({});
   const [completionMessage, setCompletionMessage] = useState("");
   const [gradingProgress, setGradingProgress] = useState(0);
-  const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
-  const [providerProgress, setProviderProgress] = useState(0);
-  const [providerMessage, setProviderMessage] = useState("");
-  const [liveProviderRecord, setLiveProviderRecord] = useState<GradeRecord | null>(null);
   const [finalScore, setFinalScore] = useState<{
     totalScore: number;
     maxScore: number;
@@ -32,34 +26,6 @@ export default function Home() {
     () => getPaperById(currentPaperId),
     [currentPaperId],
   );
-  const modelRecords = useQuizStore((state) => state.gradeRecords);
-  const latestModelRecords = useMemo(() => {
-    const latest = new Map<string, GradeRecord>();
-    modelRecords
-      .filter(
-        (record) => record.paperId === currentPaperId && record.respondentType === "model",
-      )
-      .forEach((record) => {
-        const key = record.providerId ?? record.id;
-        if (!latest.has(key)) {
-          latest.set(key, record);
-        }
-      });
-
-    return Array.from(latest.values());
-  }, [currentPaperId, modelRecords]);
-  const visibleModelRecords = useMemo(() => {
-    if (!liveProviderRecord || liveProviderRecord.paperId !== currentPaperId) {
-      return latestModelRecords;
-    }
-
-    return [
-      liveProviderRecord,
-      ...latestModelRecords.filter(
-        (record) => record.providerId !== liveProviderRecord.providerId,
-      ),
-    ];
-  }, [currentPaperId, latestModelRecords, liveProviderRecord]);
 
   const isTextQuestion = (type: string) => type === "short" || type === "essay";
 
@@ -96,38 +62,6 @@ export default function Home() {
     return answer;
   };
 
-  const renderStoredAnswer = (question: QuestionItem, answer: string) => {
-    if (!answer) {
-      return <p className="text-sm text-stone-400">未返回答案</p>;
-    }
-
-    const looksLikeChoiceAnswer =
-      (question.type === "single" || question.type === "multiple") &&
-      /^[A-Z](,[A-Z])*$/.test(answer);
-
-    if (looksLikeChoiceAnswer) {
-      const selected = getSelectedOptions(answer);
-      return (
-        <div className="space-y-2">
-          <p className="text-sm font-medium text-stone-900">{selected.join(", ")}</p>
-          <ul className="space-y-1 text-sm text-stone-600">
-            {selected.map((label) => {
-              const option = question.options?.[label.charCodeAt(0) - 65];
-              return option ? (
-                <li key={label}>
-                  <span className="mr-1">{label}.</span>
-                  <MathText text={option} inline />
-                </li>
-              ) : null;
-            })}
-          </ul>
-        </div>
-      );
-    }
-
-    return <MathText text={answer} className="text-sm leading-7 text-stone-700" />;
-  };
-
   const writeJudgeRuns = (record: RemoteGradePayload) => {
     Object.values(record.judgeResults).forEach((result) => {
       setJudgeRun(result);
@@ -140,84 +74,6 @@ export default function Home() {
       ...record,
       id: `${record.respondentType}-${record.providerId ?? "user"}-${Date.now()}`,
     });
-  };
-
-  const createLiveProviderRecord = (provider: AnswerProviderPreset): GradeRecord => ({
-    id: `live-${provider.id}-${Date.now()}`,
-    respondent: provider.label,
-    respondentType: "model",
-    providerId: provider.id,
-    paperId: currentPaper.id,
-    paperLabel: currentPaper.label,
-    totalScore: 0,
-    maxScore: questions.reduce((sum, question) => sum + Number(question.score ?? 0), 0),
-    submittedAt: new Date().toISOString(),
-    answers: {},
-    judgeResults: {},
-  });
-
-  const runProviderPaper = async (provider: AnswerProviderPreset) => {
-    setRunningProviderId(provider.id);
-    setProviderProgress(0);
-    setProviderMessage("");
-    const draftRecord = createLiveProviderRecord(provider);
-    setLiveProviderRecord(draftRecord);
-
-    try {
-      const nextAnswers: Record<string, string> = {};
-      const nextJudgeResults: GradeRecord["judgeResults"] = {};
-
-      for (let index = 0; index < questions.length; index += 1) {
-        const question = questions[index];
-        setProviderMessage(`${provider.label} 正在自动作答第 ${index + 1} 题`);
-        const result = await invokeProviderQuestion({
-          action: "run-provider-question",
-          paperId: currentPaper.id,
-          providerId: provider.id,
-          questionId: question.id,
-        });
-
-        nextAnswers[question.id] = result.answer;
-        nextJudgeResults[question.id] = result.judgeResult;
-
-        setLiveProviderRecord({
-          ...draftRecord,
-          submittedAt: result.answeredAt,
-          totalScore: Object.values(nextJudgeResults).reduce(
-            (sum, item) => sum + item.totalScore,
-            0,
-          ),
-          answers: { ...nextAnswers },
-          judgeResults: { ...nextJudgeResults },
-        });
-        setProviderProgress(Math.round(((index + 1) / questions.length) * 100));
-      }
-
-      persistRecord({
-        respondent: provider.label,
-        respondentType: "model",
-        providerId: provider.id,
-        paperId: currentPaper.id,
-        paperLabel: currentPaper.label,
-        totalScore: Object.values(nextJudgeResults).reduce(
-          (sum, item) => sum + item.totalScore,
-          0,
-        ),
-        maxScore: draftRecord.maxScore,
-        submittedAt: new Date().toISOString(),
-        answers: { ...nextAnswers },
-        judgeResults: { ...nextJudgeResults },
-      });
-      setLiveProviderRecord(null);
-      setProviderMessage(`${provider.label} 已完成自动答题和判卷。`);
-    } catch (error) {
-      setProviderMessage(
-        error instanceof Error ? error.message : `${provider.label} 执行失败。`,
-      );
-    } finally {
-      setRunningProviderId(null);
-      setProviderProgress(0);
-    }
   };
 
   const handleSelectOption = (questionId: string, label: string, multiple = false) => {
@@ -292,62 +148,11 @@ export default function Home() {
                   setCurrentPaper(paper.id);
                   setCompletionMessage("");
                   setSubmissionError({});
-                  setProviderMessage("");
-                  setLiveProviderRecord(null);
                 }}
               >
                 {paper.label}
               </button>
             ))}
-          </div>
-
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {answerProviderPresets.map((provider) => {
-                const isRunning = runningProviderId === provider.id;
-                return (
-                  <button
-                    key={provider.id}
-                    type="button"
-                    disabled={Boolean(runningProviderId) || isCompleting}
-                    className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm transition ${
-                      "border-stone-300 bg-white text-stone-700 hover:border-stone-500"
-                    } disabled:cursor-not-allowed disabled:opacity-60`}
-                    onClick={() => runProviderPaper(provider)}
-                  >
-                    {isRunning ? (
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                    ) : null}
-                    {provider.label}
-                  </button>
-                );
-              })}
-            </div>
-
-            {runningProviderId ? (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm text-stone-600">
-                  <span>
-                    {
-                      answerProviderPresets.find((item) => item.id === runningProviderId)
-                        ?.label
-                    }{" "}
-                    正在自动答题
-                  </span>
-                  <span>{providerProgress}%</span>
-                </div>
-                <div className="h-2 overflow-hidden rounded-full bg-stone-200">
-                  <div
-                    className="h-full rounded-full bg-stone-900 transition-all duration-300"
-                    style={{ width: `${providerProgress}%` }}
-                  />
-                </div>
-              </div>
-            ) : null}
-
-            {providerMessage ? (
-              <p className="text-sm text-stone-500">{providerMessage}</p>
-            ) : null}
           </div>
         </div>
 
@@ -495,45 +300,6 @@ export default function Home() {
                               <div className="mt-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 text-stone-600">
                                 <MathText text={judgeRuns[question.id]?.summary ?? ""} />
                               </div>
-                            </div>
-                          ) : null}
-
-                          {visibleModelRecords.length ? (
-                            <div className="mt-4 space-y-3">
-                              {visibleModelRecords.map((record) => {
-                                const judgeResult = record.judgeResults[question.id];
-                                return (
-                                  <div
-                                    key={`${record.id}-${question.id}`}
-                                    className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-4"
-                                  >
-                                    <div className="flex flex-wrap items-center justify-between gap-3">
-                                      <span className="rounded-full bg-white px-3 py-1 text-xs text-stone-600">
-                                        {record.respondent}
-                                      </span>
-                                      <span className="text-sm text-stone-500">
-                                        {judgeResult
-                                          ? `${judgeResult.totalScore}/${judgeResult.maxScore}`
-                                          : "--"}
-                                      </span>
-                                    </div>
-                                    <div className="mt-3">
-                                      {renderStoredAnswer(
-                                        question,
-                                        record.answers[question.id] ?? "",
-                                      )}
-                                    </div>
-                                    {judgeResult ? (
-                                      <div className="mt-3 rounded-2xl bg-white px-4 py-3">
-                                        <MathText
-                                          text={judgeResult.summary}
-                                          className="text-sm leading-6 text-stone-600"
-                                        />
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                );
-                              })}
                             </div>
                           ) : null}
                         </div>

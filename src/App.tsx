@@ -1,11 +1,9 @@
-import { FileText, Swords } from "lucide-react";
+import { FileText } from "lucide-react";
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
 import Home from "@/pages/Home";
-import Workspace from "@/pages/Workspace";
 
 const navItems = [
   { to: "/", label: "试卷", icon: FileText },
-  { to: "/workspace", label: "成绩单", icon: Swords },
 ];
 
 export default function App() {
@@ -39,7 +37,6 @@ export default function App() {
           <main className="pb-8">
             <Routes>
               <Route path="/" element={<Home />} />
-              <Route path="/workspace" element={<Workspace />} />
             </Routes>
           </main>
         </div>
